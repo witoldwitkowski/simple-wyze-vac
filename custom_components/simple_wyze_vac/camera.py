@@ -53,7 +53,7 @@ class SWVLiveCamera(Camera):
         self._live = pl["live"]
         self._device_name = pl["name"]
         self._model = pl["model"]
-        self.content_type = "image/jpeg"
+        self.content_type = "image/png"
         self._attr_name = pl["name"] + " Live Map"
         self._attr_unique_id = "swv_" + pl["name"] + "_live_map"
 
