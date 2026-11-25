@@ -33,6 +33,8 @@ from .const import (
 
 from wyze_sdk import Client
 
+from .live_map import LiveMap
+
 _LOGGER = logging.getLogger(__name__)
 
 # List of platforms to support. There should be a matching .py file for each,
@@ -96,7 +98,8 @@ async def async_setup_entry(hass: core.HomeAssistant, entry: ConfigEntry) -> boo
             "main_brush": vac_info.supplies.main_brush.remaining,
             "side_brush": vac_info.supplies.side_brush.remaining,
             "room_manager": room_manager,
-            "battery": WyzeBattery(vac_info.voltage)
+            "battery": WyzeBattery(vac_info.voltage),
+            "live": LiveMap(device.mac)
         }
 
         hass.data[WYZE_VACUUMS].append(payload)

@@ -12,9 +12,11 @@ from .const import CONF_TOTP, WYZE_VACUUMS, WYZE_USERNAME, WYZE_PASSWORD, \
                    DOMAIN, \
                    CONF_POLLING, WYZE_SCAN_INTERVAL, CONF_KEY_ID, CONF_API_KEY
 
-from wyze_sdk.models.devices import VacuumMode, VacuumSuctionLevel
+from wyze_sdk.models.devices import VacuumSuctionLevel
 from wyze_sdk.errors import WyzeApiError, WyzeClientNotConnectedError
 from wyze_sdk import Client
+
+from .live_map import activity_from_mode
 
 from homeassistant.helpers import config_validation as cv, entity_platform
 from homeassistant.helpers.event import async_track_time_interval
@@ -77,6 +79,9 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
 
     async_add_entities(vacs, True)
 
+    for vac in vacs:
+        vac.start_live_map(hass, config_entry)
+
     platform = entity_platform.current_platform.get()
 
     platform.async_register_entity_service(
@@ -114,6 +119,7 @@ class WyzeVac(StateVacuumEntity):
         self._polling = polling
 
         self._room_manager = pl["room_manager"]
+        self._live = pl["live"]
         self._wyze_battery = pl["battery"]
 
         self._rooms = []
@@ -128,6 +134,24 @@ class WyzeVac(StateVacuumEntity):
         SCAN_INTERVAL = self._scan_interval
         if self._polling:
             _LOGGER.warn(f"Simple Wyze Vac Polling every {scan_interval} ({SCAN_INTERVAL}). Careful of hitting Wyze servers rate limits.")
+
+    def start_live_map(self, hass, config_entry):
+        """Let the live map follow this vacuum."""
+        self._live.start(hass, config_entry, self)
+
+    def async_live_status(self, activity, battery, finished):
+        """Take over the status the live map just read from Wyze."""
+        changed = activity != self._last_mode
+        self._last_mode = activity
+        if battery is not None and battery != self._wyze_battery.value:
+            self._wyze_battery.value = battery
+            changed = True
+        if changed:
+            self.async_write_ha_state()
+        if finished:
+            # a run just ended: refresh the run statistics and the last-run map
+            self._force_update = True
+            self.async_schedule_update_ha_state(force_refresh=True)
 
     @property
     def device_info(self):
@@ -211,6 +235,7 @@ class WyzeVac(StateVacuumEntity):
         self._client = await self.hass.async_add_executor_job(lambda: Client(email=self._username, password=self._password, key_id=self._key_id, api_key=self._api_key, totp_key=self._totp))
 
     async def async_start(self, **kwargs):
+        self._live.poke()
         try:
             vacuum = await self.hass.async_add_executor_job(lambda: self._client.vacuums.info(device_mac=self._vac_mac))
         except (WyzeApiError, WyzeClientNotConnectedError) as e:
@@ -223,6 +248,7 @@ class WyzeVac(StateVacuumEntity):
 
     async def async_pause(self, **kwargs):
         """Stop the vacuum cleaner."""
+        self._live.poke()
         try:
             vacuum = await self.hass.async_add_executor_job(lambda: self._client.vacuums.info(device_mac=self._vac_mac))
         except (WyzeApiError, WyzeClientNotConnectedError) as e:
@@ -236,6 +262,7 @@ class WyzeVac(StateVacuumEntity):
 
     async def async_stop(self, **kwargs):
         """Stop the vacuum cleaner."""
+        self._live.poke()
         try:
             vacuum = await self.hass.async_add_executor_job(lambda: self._client.vacuums.info(device_mac=self._vac_mac))
         except (WyzeApiError, WyzeClientNotConnectedError) as e:
@@ -249,6 +276,7 @@ class WyzeVac(StateVacuumEntity):
 
     async def async_return_to_base(self, **kwargs):
         """Set the vacuum cleaner to return to the dock."""
+        self._live.poke()
         try:
            vacuum = await self.hass.async_add_executor_job(lambda: self._client.vacuums.info(device_mac=self._vac_mac))
         except (WyzeApiError, WyzeClientNotConnectedError) as e:
@@ -275,6 +303,7 @@ class WyzeVac(StateVacuumEntity):
         self.async_schedule_update_ha_state(force_refresh=True)
 
     async def async_send_command(self, command, params=None, **kwargs):
+        self._live.poke()
         try:
             vacuum = await self.hass.async_add_executor_job(lambda: self._client.vacuums.info(device_mac=self._vac_mac))
         except (WyzeApiError, WyzeClientNotConnectedError) as e:
@@ -332,16 +361,7 @@ class WyzeVac(StateVacuumEntity):
             vacuum = await self.hass.async_add_executor_job(lambda: self._client.vacuums.info(device_mac=self._vac_mac))            
 
         # Get vacuum mode
-        if vacuum.mode in [VacuumMode.SWEEPING, VacuumMode.CLEANING, VacuumMode.QUICK_MAPPING_MAPPING]:
-            self._last_mode = VacuumActivity.CLEANING
-        elif vacuum.mode in [VacuumMode.IDLE, VacuumMode.BREAK_POINT, VacuumMode.DOCKED_NOT_COMPLETE, VacuumMode.QUICK_MAPPING_DOCKED_NOT_COMPLETE]:
-            self._last_mode = VacuumActivity.DOCKED
-        elif vacuum.mode in [VacuumMode.ON_WAY_CHARGE, VacuumMode.FULL_FINISH_SWEEPING_ON_WAY_CHARGE, VacuumMode.FINISHED_RETURNING_TO_CHARGE, VacuumMode.RETURNING_TO_CHARGE, VacuumMode.QUICK_MAPPING_COMPLETED_RETURNING_TO_CHARGE]:
-            self._last_mode = VacuumActivity.RETURNING
-        elif vacuum.mode in [VacuumMode.PAUSED, VacuumMode.PAUSE, VacuumMode.QUICK_MAPPING_PAUSED]:
-            self._last_mode = VacuumActivity.PAUSED
-        else:
-            self._last_mode = VacuumActivity.ERROR
+        self._last_mode = activity_from_mode(vacuum.mode)
 
         # Update battery
         self._wyze_battery.value = vacuum.voltage
