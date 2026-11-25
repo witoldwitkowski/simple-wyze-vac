@@ -61,6 +61,7 @@ If it all worked out, you should now have Wyze vacuum entity(ies)
 - Return to Base
 - Filter lifespan information (Main filter, main brush and side brush)
 - Camera entity to show last vacuum map
+- Floor plan image entity (`image.<vacuum>_floor_plan`): rooms, no-go areas, the estimated route while cleaning, and the route the vacuum actually drove on its last run
 - Room names as toggleable switches (For area cleaning)
 - Room names as vacuum attributes
 - Battery Level

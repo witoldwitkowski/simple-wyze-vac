@@ -39,7 +39,7 @@ _LOGGER = logging.getLogger(__name__)
 
 # List of platforms to support. There should be a matching .py file for each,
 # eg <cover.py> and <sensor.py>
-PLATFORMS: list[str] = ["vacuum", "switch", "camera", "sensor"]
+PLATFORMS: list[str] = ["vacuum", "switch", "camera", "sensor", "image"]
 
 
 async def async_setup_entry(hass: core.HomeAssistant, entry: ConfigEntry) -> bool:
