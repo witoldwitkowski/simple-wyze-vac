@@ -14,7 +14,6 @@ from .const import CONF_TOTP, WYZE_VACUUMS, WYZE_USERNAME, WYZE_PASSWORD, \
 
 from wyze_sdk.models.devices import VacuumSuctionLevel
 from wyze_sdk.errors import WyzeApiError, WyzeClientNotConnectedError
-from wyze_sdk import Client
 
 from .live_map import activity_from_mode
 
@@ -120,6 +119,7 @@ class WyzeVac(StateVacuumEntity):
 
         self._room_manager = pl["room_manager"]
         self._live = pl["live"]
+        self._session = pl["session"]
         self._wyze_battery = pl["battery"]
 
         self._rooms = []
@@ -231,8 +231,11 @@ class WyzeVac(StateVacuumEntity):
         return data
 
     async def get_new_client(self):
-        _LOGGER.warn("Refreshing Wyze Client. Do this sparingly to be prevent lockout.")
-        self._client = await self.hass.async_add_executor_job(lambda: Client(email=self._username, password=self._password, key_id=self._key_id, api_key=self._api_key, totp_key=self._totp))
+        """Renew the Wyze session. This refreshes the token; it logs in again only if Wyze refuses that."""
+        try:
+            await self._session.async_renew()
+        except Exception as err:
+            _LOGGER.warning("Could not renew the Wyze session: %s", type(err).__name__)
 
     async def async_start(self, **kwargs):
         self._live.poke()

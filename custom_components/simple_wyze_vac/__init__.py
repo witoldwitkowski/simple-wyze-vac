@@ -10,6 +10,7 @@ import homeassistant.helpers.config_validation as cv
 from homeassistant.config_entries import ConfigEntry
 from homeassistant import core
 from homeassistant.helpers import discovery
+from homeassistant.exceptions import ConfigEntryNotReady
 
 from homeassistant.const import (
     CONF_USERNAME,
@@ -31,9 +32,8 @@ from .const import (
 )
 
 
-from wyze_sdk import Client
-
 from .live_map import LiveMap
+from .session import WyzeSession, storage_for
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -52,7 +52,12 @@ async def async_setup_entry(hass: core.HomeAssistant, entry: ConfigEntry) -> boo
     api_key = entry.data.get(CONF_API_KEY)
     totp = entry.data.get(CONF_TOTP) if entry.data.get(CONF_TOTP) else None
 
-    client = await hass.async_add_executor_job(Client, None, None, username, password, key_id, api_key, totp)
+    session = WyzeSession(hass, entry.entry_id, username, password, key_id, api_key, totp)
+    try:
+        client = await session.async_connect()
+    except Exception as err:
+        # only the error type: SDK error messages can carry request details
+        raise ConfigEntryNotReady(f"Could not connect to Wyze ({type(err).__name__})") from err
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = client
 
@@ -99,7 +104,8 @@ async def async_setup_entry(hass: core.HomeAssistant, entry: ConfigEntry) -> boo
             "side_brush": vac_info.supplies.side_brush.remaining,
             "room_manager": room_manager,
             "battery": WyzeBattery(vac_info.voltage),
-            "live": LiveMap(device.mac)
+            "live": LiveMap(device.mac),
+            "session": session
         }
 
         hass.data[WYZE_VACUUMS].append(payload)
@@ -128,6 +134,10 @@ async def async_unload_entry(hass: core.HomeAssistant, entry: ConfigEntry) -> bo
         hass.data[DOMAIN].pop(entry.entry_id)
 
     return unload_ok
+
+async def async_remove_entry(hass, entry):
+    """Delete the saved tokens together with the integration."""
+    await storage_for(hass, entry.entry_id).async_remove()
 
 async def update_listener(hass, entry):
     """Handle options update."""
