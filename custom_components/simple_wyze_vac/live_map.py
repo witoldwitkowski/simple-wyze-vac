@@ -6,6 +6,7 @@ position request every ten seconds.
 """
 import asyncio
 import base64
+import heapq
 import io
 import logging
 import time
@@ -72,10 +73,10 @@ def _text(value):
     return value.decode(errors="replace") if isinstance(value, bytes) else str(value)
 
 
-def _smooth(mask, size):
+def _smooth(mask, size, threshold=127):
     """Scale a one-pixel-per-cell mask up to the picture size with rounded, antialiased edges."""
     large = mask.resize((size[0] * SMOOTH, size[1] * SMOOTH), Image.Resampling.BILINEAR)
-    return large.point(lambda v: 255 if v > 127 else 0).resize(size, Image.Resampling.LANCZOS)
+    return large.point(lambda v: 255 if v > threshold else 0).resize(size, Image.Resampling.LANCZOS)
 
 
 def _label_cell(mask):
@@ -107,7 +108,7 @@ def _draw_vacuum(draw, x, y, size):
     draw.ellipse((x - size * 0.32, y - size * 0.32, x + size * 0.32, y + size * 0.32), fill=(255, 255, 255))
 
 
-def _draw_trail(draw, points, width):
+def _draw_trail(draw, points, width, samples):
     """Dashes, because the line between two samples is only an estimate of the route."""
     dash, gap, offset = width * 2.4, width * 1.8, 0.0
     for (x1, y1), (x2, y2) in zip(points, points[1:]):
@@ -120,7 +121,7 @@ def _draw_trail(draw, points, width):
                           fill=VACUUM + (215,), width=width)
             position += dash + gap
         offset = (offset + length) % (dash + gap)
-    for x, y in points[:-1]:
+    for x, y in samples:
         draw.ellipse((x - width, y - width, x + width, y + width), fill=VACUUM, outline=(255, 255, 255), width=width // 3)
 
 
@@ -136,6 +137,80 @@ def _draw_no_go(image, points):
     layer.putalpha(ImageChops.multiply(layer.getchannel("A"), mask))
     image.alpha_composite(layer)
     ImageDraw.Draw(image).line(points + points[:1], fill=NO_GO + (255,), width=5, joint="curve")
+
+
+class Router:
+    """Estimates the route between two position samples: around walls, not through them."""
+
+    def __init__(self, grid):
+        self._width, self._height = grid.size
+        blocked = grid.point(lambda v: 255 if v in (0, 1, 255) else 0)
+        near = blocked.filter(ImageFilter.MaxFilter(3))
+        self._blocked = blocked.tobytes()
+        # walls stay passable at a high price, so a sample on an obstacle still gets a route
+        self._cost = [40 if wall else 4 if close else 1 for wall, close in zip(self._blocked, near.tobytes())]
+        self._cache = {}
+
+    def _index(self, x, y):
+        column = min(max(int(x), 0), self._width - 1)
+        row = min(max(int(y), 0), self._height - 1)
+        return row * self._width + column
+
+    def clear(self, a, b):
+        steps = int(max(abs(b[0] - a[0]), abs(b[1] - a[1])) * 2) + 1
+        return not any(self._blocked[self._index(a[0] + (b[0] - a[0]) * i / steps, a[1] + (b[1] - a[1]) * i / steps)]
+                       for i in range(steps + 1))
+
+    def between(self, a, b):
+        """Waypoints (in cells) from a to b."""
+        if (a, b) not in self._cache:
+            self._cache[(a, b)] = [a, b] if self.clear(a, b) else self._search(a, b)
+        return self._cache[(a, b)]
+
+    def _search(self, a, b):
+        width = self._width
+        start, goal = self._index(*a), self._index(*b)
+        goal_y, goal_x = divmod(goal, width)
+        best, came, queue = {start: 0.0}, {}, [(0.0, start)]
+        while queue:
+            _, here = heapq.heappop(queue)
+            if here == goal:
+                break
+            y, x = divmod(here, width)
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)):
+                nx, ny = x + dx, y + dy
+                if not (0 <= nx < width and 0 <= ny < self._height):
+                    continue
+                there = ny * width + nx
+                total = best[here] + self._cost[there] * (1.414 if dx and dy else 1.0)
+                if total < best.get(there, float("inf")):
+                    best[there], came[there] = total, here
+                    heapq.heappush(queue, (total + ((nx - goal_x) ** 2 + (ny - goal_y) ** 2) ** 0.5, there))
+        cells, here = [], goal
+        while here != start and here in came:
+            here = came[here]
+            y, x = divmod(here, width)
+            cells.append((x + 0.5, y + 0.5))
+        cells = [a] + cells[::-1][1:] + [b]
+        # keep only the corners that are needed
+        route, i = [a], 0
+        while i < len(cells) - 1:
+            j = next((j for j in range(len(cells) - 1, i, -1) if self.clear(cells[i], cells[j])), i + 1)
+            route.append(cells[j])
+            i = j
+        return route
+
+    def curve(self, points):
+        """Round the corners (Catmull-Rom), staying straight wherever a curve would cut a wall."""
+        smooth = points[:1]
+        for i in range(len(points) - 1):
+            p0, p1, p2, p3 = points[max(i - 1, 0)], points[i], points[i + 1], points[min(i + 2, len(points) - 1)]
+            piece = [tuple(0.5 * (2 * p1[k] + (p2[k] - p0[k]) * t + (2 * p0[k] - 5 * p1[k] + 4 * p2[k] - p3[k]) * t * t
+                                  + (3 * p1[k] - p0[k] - 3 * p2[k] + p3[k]) * t ** 3) for k in (0, 1))
+                     for t in (n / 8 for n in range(1, 9))]
+            hits = any(not self.clear(u, v) for u, v in zip([p1] + piece, piece))
+            smooth.extend([p2] if hits else piece)
+        return smooth
 
 
 class BaseMap:
@@ -179,6 +254,10 @@ class BaseMap:
             grown = ImageChops.multiply(mask.filter(ImageFilter.MaxFilter(5)), floor)
             plan.paste(ROOM_COLORS[index % len(ROOM_COLORS)] + (255,),
                        mask=ImageChops.multiply(_smooth(flip(grown), size), shape))
+
+        walls = grid.point(lambda v: 255 if v == 255 else 0)
+        plan.paste(OUTLINE + (255,), mask=_smooth(flip(walls), size, 95))
+        self._router = Router(grid)
 
         areas = []
         for area in _items(data.get("virtualWalls_")):
@@ -231,7 +310,7 @@ class BaseMap:
             if name == "Vacuum":
                 _draw_vacuum(draw, x + 16, y, 12)
             elif name == "Path":
-                _draw_trail(draw, [(x, y), (x + 34, y)], 6)
+                _draw_trail(draw, [(x, y), (x + 34, y)], 6, [(x, y)])
             elif name == "Dock":
                 _draw_dock(draw, x + 16, y, 16)
             else:
@@ -240,11 +319,24 @@ class BaseMap:
             draw.text((x + 46, y), name, font=font, fill=INK, anchor="lm")
             x += width + 40
 
+    def _cell(self, x, y):
+        """Convert map metres to cells of the cropped grid."""
+        return ((x - self._min_x) / self._resolution - self._left, (y - self._min_y) / self._resolution - self._top)
+
+    def _from_cell(self, cell):
+        return (cell[0] * SCALE, (self._rows - cell[1]) * SCALE)
+
     def pixel(self, x, y):
         """Convert map metres to picture pixels."""
-        column = (x - self._min_x) / self._resolution - self._left
-        row = (y - self._min_y) / self._resolution - self._top
-        return (column * SCALE, (self._rows - row) * SCALE)
+        return self._from_cell(self._cell(x, y))
+
+    def route(self, path):
+        """The estimated route through all samples, in picture pixels."""
+        cells = [self._cell(x, y) for x, y in path]
+        points = cells[:1]
+        for a, b in zip(cells, cells[1:]):
+            points.extend(self._router.between(a, b)[1:])
+        return [self._from_cell(c) for c in self._router.curve(points)]
 
     def frame(self, path):
         """Return a PNG of the floor plan with this run's path and the newest position on top."""
@@ -254,7 +346,8 @@ class BaseMap:
             large = Image.new("RGBA", (image.width * SMOOTH, image.height * SMOOTH), VACUUM + (0,))
             draw = ImageDraw.Draw(large, "RGBA")
             scaled = [(x * SMOOTH, y * SMOOTH) for x, y in points]
-            _draw_trail(draw, scaled, 5 * SMOOTH)
+            line = [(x * SMOOTH, y * SMOOTH) for x, y in self.route(path)]
+            _draw_trail(draw, line, 5 * SMOOTH, scaled[:-1])
             _draw_vacuum(draw, *scaled[-1], 18 * SMOOTH)
             image.alpha_composite(large.resize(image.size, Image.Resampling.LANCZOS))
         output = io.BytesIO()
