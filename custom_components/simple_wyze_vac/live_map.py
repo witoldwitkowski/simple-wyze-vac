@@ -1,8 +1,9 @@
 """Live map: draw the current map with the vacuum's position and the path seen so far.
 
 Wyze only reports the newest position, so the path is built from the samples collected while a run is active.
-While the vacuum is idle this makes one small status request per minute; while it is active, a status and a
-position request every ten seconds.
+Requests: while cleaning or returning, a status and a position request every ten seconds; while paused, the
+same once a minute; while idle, one status request every five minutes. A command from Home Assistant makes it
+look at once. A rate limit from Wyze stops all of it for ten minutes.
 """
 import asyncio
 import base64
@@ -22,15 +23,20 @@ from homeassistant.helpers.event import async_track_time_interval
 from wyze_sdk.models.devices import VacuumMode
 from wyze_sdk.models.devices.vacuums import VacuumMap
 
+from .wyze_errors import is_rate_limited, is_token_expired
+
 _LOGGER = logging.getLogger(__name__)
 
 TICK = timedelta(seconds=10)
-IDLE_CHECK_SECONDS = 60
-EAGER_SECONDS = 90  # keep checking every tick for this long after a command from Home Assistant
+IDLE_CHECK_SECONDS = 300
+PAUSED_CHECK_SECONDS = 60
+ERROR_PAUSE_SECONDS = 60
+EAGER_SECONDS = 120  # keep checking every tick for this long after a command from Home Assistant
 RATE_LIMIT_PAUSE_SECONDS = 600
-LOGIN_RETRY_SECONDS = 900
+RENEW_RETRY_SECONDS = 900
 MAX_PATH_POINTS = 3000
-ACTIVE = (VacuumActivity.CLEANING, VacuumActivity.RETURNING, VacuumActivity.PAUSED)
+MOVING = (VacuumActivity.CLEANING, VacuumActivity.RETURNING)
+ACTIVE = MOVING + (VacuumActivity.PAUSED,)  # a run is under way
 
 SCALE = 5
 SMOOTH = 2  # shapes are drawn this much larger, then scaled down for soft edges
@@ -373,6 +379,7 @@ class LiveMap:
         self._paused_until = 0.0
         self._next_login = 0.0
         self._was_active = False
+        self._moving = False
 
     def start(self, hass, config_entry, vacuum):
         """Begin following the vacuum entity."""
@@ -401,10 +408,8 @@ class LiveMap:
         now = time.monotonic()
         if now < self._paused_until:
             return
-        if not (self._was_active or now < self._eager_until or now >= self._next_check):
+        if not (self._moving or now < self._eager_until or now >= self._next_check):
             return
-        self._next_check = now + IDLE_CHECK_SECONDS
-
         async with self._lock:
             try:
                 activity, battery = await vacuum.hass.async_add_executor_job(self._read_status)
@@ -414,11 +419,13 @@ class LiveMap:
             except Exception as err:  # the SDK raises several unrelated error types
                 relogin = self._failed(err)
                 if relogin:
-                    await vacuum.get_new_client()
+                    await vacuum.get_new_client(err)
                 return
 
         finished = self._was_active and not active
         self._was_active = active
+        self._moving = activity in MOVING
+        self._next_check = now + (PAUSED_CHECK_SECONDS if activity == VacuumActivity.PAUSED else IDLE_CHECK_SECONDS)
         if finished:
             # back to the clean floor plan; the next run starts a new path
             self._path = []
@@ -462,17 +469,15 @@ class LiveMap:
         self._image = self._base.frame(self._path)
 
     def _failed(self, err):
-        """Back off after an error. Returns True when a new login is worth one try."""
-        status = getattr(getattr(err, "response", None), "status_code", None)
+        """Back off after an error. Returns True when renewing the session is worth one try."""
         now = time.monotonic()
-        if status == 429 or "429" in str(err):
+        if is_rate_limited(err):
             self._paused_until = now + RATE_LIMIT_PAUSE_SECONDS
             _LOGGER.warning("Wyze rate limit reached; live map paused for %s seconds", RATE_LIMIT_PAUSE_SECONDS)
             return False
-        self._paused_until = now + IDLE_CHECK_SECONDS
+        self._paused_until = now + ERROR_PAUSE_SECONDS
         _LOGGER.warning("Live map update failed: %s", type(err).__name__)
-        expired = status == 401 or "token" in str(err).lower()
-        if expired and now >= self._next_login:
-            self._next_login = now + LOGIN_RETRY_SECONDS
+        if is_token_expired(err) and now >= self._next_login:
+            self._next_login = now + RENEW_RETRY_SECONDS
             return True
         return False

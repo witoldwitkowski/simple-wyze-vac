@@ -25,7 +25,8 @@ class BatterySensor(SensorEntity):
 
     _attr_has_entity_name = True
     _attr_name = None
-    _attr_should_poll = False
+    # reads the value the vacuum already holds, so polling it sends nothing to Wyze
+    _attr_should_poll = True
 
     def __init__(
         self,

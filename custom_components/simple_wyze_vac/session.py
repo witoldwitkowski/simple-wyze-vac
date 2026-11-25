@@ -10,16 +10,17 @@ import logging
 import time
 
 from wyze_sdk import Client
-from wyze_sdk.errors import WyzeApiError
 
 from homeassistant.helpers.storage import Store
 
 from .const import DOMAIN
+from .wyze_errors import is_rate_limited, is_refresh_refused, is_token_expired
 
 _LOGGER = logging.getLogger(__name__)
 
 STORAGE_VERSION = 1
 LOGIN_PAUSE_SECONDS = 600
+RATE_LIMIT_PAUSE_SECONDS = 600
 RENEW_PAUSE_SECONDS = 300
 
 
@@ -27,17 +28,13 @@ class LoginPaused(Exception):
     """A password login was tried too recently to try again."""
 
 
+class RateLimited(Exception):
+    """Wyze asked for fewer requests, so none are being sent for now."""
+
+
 def storage_for(hass, entry_id):
     """Where the tokens of one config entry are kept (readable by Home Assistant only)."""
     return Store(hass, STORAGE_VERSION, f"{DOMAIN}.{entry_id}", private=True)
-
-
-def _rejected(err):
-    """Did Wyze turn the request down, as opposed to a network problem or a rate limit?"""
-    if isinstance(err, WyzeApiError):
-        return True
-    status = getattr(getattr(err, "response", None), "status_code", None)
-    return status in (400, 401, 403)
 
 
 class WyzeSession:
@@ -57,6 +54,7 @@ class WyzeSession:
         """Return a working client, reusing the saved tokens when Wyze still accepts them."""
         saved = await self._store.async_load() or {}
         self._data = saved if saved.get("account") == self._credentials["email"] else {}
+        self._check_quiet()
 
         if not (self._data.get("access_token") and self._data.get("refresh_token")):
             async with self._lock:
@@ -70,7 +68,8 @@ class WyzeSession:
         try:
             await self._hass.async_add_executor_job(self.client.vacuums.list)
         except Exception as err:  # the SDK raises several unrelated error types
-            if not _rejected(err):
+            await self._async_note_rate_limit(err)
+            if not is_token_expired(err):
                 raise
             await self.async_renew()
         else:
@@ -82,10 +81,12 @@ class WyzeSession:
         async with self._lock:
             if self._renewed_at is not None and time.monotonic() - self._renewed_at < RENEW_PAUSE_SECONDS:
                 return
+            self._check_quiet()
             try:
                 await self._hass.async_add_executor_job(self.client.refresh_token)
             except Exception as err:  # the SDK raises several unrelated error types
-                if not _rejected(err):
+                await self._async_note_rate_limit(err)
+                if not is_refresh_refused(err):
                     raise
                 _LOGGER.warning("Wyze rejected the saved session; logging in with the password")
                 await self._async_login()
@@ -94,7 +95,20 @@ class WyzeSession:
             await self._async_save()
             _LOGGER.info("Renewed the Wyze access token")
 
+    def _check_quiet(self):
+        wait = self._data.get("quiet_until", 0) - time.time()
+        if wait > 0:
+            raise RateLimited(f"waiting {int(wait)} seconds after a Wyze rate limit")
+
+    async def _async_note_rate_limit(self, err):
+        """Remember a rate limit, also across restarts, and stay quiet for a while."""
+        if is_rate_limited(err):
+            self._data = {**self._data, "account": self._credentials["email"],
+                          "quiet_until": time.time() + RATE_LIMIT_PAUSE_SECONDS}
+            await self._store.async_save(self._data)
+
     async def _async_login(self):
+        self._check_quiet()
         wait = self._data.get("next_login", 0) - time.time()
         if wait > 0:
             raise LoginPaused(f"next password login allowed in {int(wait)} seconds")
@@ -103,7 +117,11 @@ class WyzeSession:
                       "next_login": time.time() + LOGIN_PAUSE_SECONDS}
         await self._store.async_save(self._data)
 
-        fresh = await self._hass.async_add_executor_job(lambda: Client(**self._credentials))
+        try:
+            fresh = await self._hass.async_add_executor_job(lambda: Client(**self._credentials))
+        except Exception as err:
+            await self._async_note_rate_limit(err)
+            raise
         if self.client is None:
             self.client = fresh
         else:

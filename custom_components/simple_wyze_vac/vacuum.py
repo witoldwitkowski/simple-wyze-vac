@@ -16,6 +16,7 @@ from wyze_sdk.models.devices import VacuumSuctionLevel
 from wyze_sdk.errors import WyzeApiError, WyzeClientNotConnectedError
 
 from .live_map import activity_from_mode
+from .wyze_errors import is_token_expired
 
 from homeassistant.helpers import config_validation as cv, entity_platform
 from homeassistant.helpers.event import async_track_time_interval
@@ -230,8 +231,13 @@ class WyzeVac(StateVacuumEntity):
 
         return data
 
-    async def get_new_client(self):
-        """Renew the Wyze session. This refreshes the token; it logs in again only if Wyze refuses that."""
+    async def get_new_client(self, error=None):
+        """Renew the Wyze session. This refreshes the token; it logs in again only if Wyze refuses that.
+
+        After a failed request, pass its error: only an expired token is a reason to renew.
+        """
+        if isinstance(error, WyzeApiError) and not is_token_expired(error):
+            return
         try:
             await self._session.async_renew()
         except Exception as err:
@@ -243,7 +249,7 @@ class WyzeVac(StateVacuumEntity):
             vacuum = await self.hass.async_add_executor_job(lambda: self._client.vacuums.info(device_mac=self._vac_mac))
         except (WyzeApiError, WyzeClientNotConnectedError) as e:
             _LOGGER.warn("Received WyzeApiError")
-            await self.get_new_client()
+            await self.get_new_client(e)
         finally:
             await self.hass.async_add_executor_job(lambda: self._client.vacuums.clean(device_mac=self._vac_mac, device_model=self._model))
         
@@ -256,7 +262,7 @@ class WyzeVac(StateVacuumEntity):
             vacuum = await self.hass.async_add_executor_job(lambda: self._client.vacuums.info(device_mac=self._vac_mac))
         except (WyzeApiError, WyzeClientNotConnectedError) as e:
             _LOGGER.warn("Received WyzeApiError")
-            await self.get_new_client()
+            await self.get_new_client(e)
         finally:
             await self.hass.async_add_executor_job(lambda: self._client.vacuums.pause(device_mac=self._vac_mac, device_model=self._model))
         self._last_mode = VacuumActivity.PAUSED
@@ -270,7 +276,7 @@ class WyzeVac(StateVacuumEntity):
             vacuum = await self.hass.async_add_executor_job(lambda: self._client.vacuums.info(device_mac=self._vac_mac))
         except (WyzeApiError, WyzeClientNotConnectedError) as e:
             _LOGGER.warn("Received WyzeApiError")
-            await self.get_new_client()
+            await self.get_new_client(e)
         finally:
             await self.hass.async_add_executor_job(lambda: self._client.vacuums.pause(device_mac=self._vac_mac, device_model=self._model))
         self._last_mode = VacuumActivity.PAUSED
@@ -284,7 +290,7 @@ class WyzeVac(StateVacuumEntity):
            vacuum = await self.hass.async_add_executor_job(lambda: self._client.vacuums.info(device_mac=self._vac_mac))
         except (WyzeApiError, WyzeClientNotConnectedError) as e:
             _LOGGER.warn("Received WyzeApiError")
-            await self.get_new_client()
+            await self.get_new_client(e)
         finally:
             await self.hass.async_add_executor_job(lambda: self._client.vacuums.dock(device_mac=self._vac_mac, device_model=self._model))
         self._last_mode = VacuumActivity.RETURNING
@@ -311,7 +317,7 @@ class WyzeVac(StateVacuumEntity):
             vacuum = await self.hass.async_add_executor_job(lambda: self._client.vacuums.info(device_mac=self._vac_mac))
         except (WyzeApiError, WyzeClientNotConnectedError) as e:
             _LOGGER.warn("Received WyzeApiError")
-            await self.get_new_client()
+            await self.get_new_client(e)
             vacuum = await self.hass.async_add_executor_job(lambda: self._client.vacuums.info(device_mac=self._vac_mac))
             
         _LOGGER.info("Command: %s, params: %s", command, params)
@@ -360,7 +366,7 @@ class WyzeVac(StateVacuumEntity):
             vacuum = await self.hass.async_add_executor_job(lambda: self._client.vacuums.info(device_mac=self._vac_mac))
         except (WyzeApiError, WyzeClientNotConnectedError) as e:
             _LOGGER.warn("Received WyzeApiError")
-            await self.get_new_client()
+            await self.get_new_client(e)
             vacuum = await self.hass.async_add_executor_job(lambda: self._client.vacuums.info(device_mac=self._vac_mac))            
 
         # Get vacuum mode
@@ -400,7 +406,7 @@ class WyzeVac(StateVacuumEntity):
                 vacuum = await self.hass.async_add_executor_job(lambda: self._client.vacuums.info(device_mac=self._vac_mac))
             except (WyzeApiError, WyzeClientNotConnectedError) as e:
                 _LOGGER.warn("Received WyzeApiError")
-                await self.get_new_client()
+                await self.get_new_client(e)
             finally:
                 await self.hass.async_add_executor_job(lambda: self._client.vacuums.set_suction_level(device_mac=self._vac_mac, device_model=self._model, suction_level=wyze_suction))
             self.async_schedule_update_ha_state(force_refresh=True)
@@ -424,7 +430,7 @@ class WyzeVac(StateVacuumEntity):
             vacuum = await self.hass.async_add_executor_job(lambda: self._client.vacuums.info(device_mac=self._vac_mac))
         except (WyzeApiError, WyzeClientNotConnectedError) as e:
             _LOGGER.warn("Received WyzeApiError")
-            await self.get_new_client()
+            await self.get_new_client(e)
         finally:
             maps = await self.hass.async_add_executor_job(lambda: self._client.vacuums.get_maps(device_mac=self._vac_mac))
             
@@ -463,7 +469,7 @@ class WyzeVac(StateVacuumEntity):
                     break
         except (WyzeApiError, WyzeClientNotConnectedError) as e:
             _LOGGER.warn("Received WyzeApiError")
-            await self.get_new_client()
+            await self.get_new_client(e)
             map_info = await self.hass.async_add_executor_job(lambda: self._client.vacuums.get_maps(device_mac=self._vac_mac))
             for map_sum in map_info:
                 if map_sum.name == target_map:
@@ -484,7 +490,7 @@ class WyzeVac(StateVacuumEntity):
                 rooms = rooms + map_sum.rooms
         except (WyzeApiError, WyzeClientNotConnectedError) as e:
             _LOGGER.warn("Received WyzeApiError")
-            await self.get_new_client()
+            await self.get_new_client(e)
             map_info = await self.hass.async_add_executor_job(lambda: self._client.vacuums.get_maps(device_mac=self._vac_mac))
             for map_sum in map_info:
                 rooms = rooms + map_sum.rooms
